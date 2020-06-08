@@ -68,16 +68,36 @@ optimizer = optim.SGD(net.parameters(), lr=learning_rate,
 train_losses = []
 train_counter = []
 
+# register hooks on each layer
+hookF = [Hook(layer[1]) for layer in list(net._modules.items())]
+hookB = [Hook(layer[1],backward=True) for layer in list(net._modules.items())]
+
 def train(epoch):
     net.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         optimizer.zero_grad()
         
         output = net(data)
+        
+        print('***'*3+'  Forward Hooks Inputs & Outputs  '+'***'*3)
+        for hook in hookF:
+            print(hook.input)
+            print(hook.output)
+            print('---'*17)
+        
+        print('\n')
+
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
         
+        print('***'*3+'  Backward Hooks Inputs & Outputs  '+'***'*3)
+        for hook in hookB:
+            print(hook.input)
+            print(hook.output)
+            print('---'*17)
+
+
         if batch_idx % log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
