@@ -2,6 +2,11 @@ import argparse
 import os
 from threading import Lock
 
+# Links to refer for hacks
+# https://github.com/pytorch/examples/pull/842/files
+# https://github.com/pytorch/examples/issues/780
+# https://github.com/pytorch/examples/blob/1a6ba0c5197264f41b3aa79a7623cad6c1b44b3a/distributed/rpc/parameter_server/rpc_parameter_server.py
+
 import torch
 import torch.distributed.autograd as dist_autograd
 import torch.distributed.rpc as rpc
@@ -13,8 +18,9 @@ from torch.distributed.optim import DistributedOptimizer
 from torchvision import datasets, transforms
 
 # --------- MNIST Network to train, from pytorch/examples -----
-
-
+# RPC is used to call other processes on the remote systems like a local system.
+# Remote Procedure Call
+torch.autograd.set_detect_anomaly(True)
 class Net(nn.Module):
     def __init__(self, num_gpus=0):
         super(Net, self).__init__()
@@ -22,6 +28,7 @@ class Net(nn.Module):
         self.num_gpus = num_gpus
         device = torch.device(
             "cuda:0" if torch.cuda.is_available() and self.num_gpus > 0 else "cpu")
+        print(device, '*'*20)
         print(f"Putting first 2 convs on {str(device)}")
         # Put conv layers on the first cuda device
         self.conv1 = nn.Conv2d(1, 32, 3, 1).to(device)
@@ -38,7 +45,7 @@ class Net(nn.Module):
 
     def forward(self, x):
         x = self.conv1(x)
-        x = F.relu(x)
+        x = F.relu(x, inplace=False)
         x = self.conv2(x)
         x = F.max_pool2d(x, 2)
 
@@ -49,9 +56,10 @@ class Net(nn.Module):
         x = x.to(next_device)
 
         x = self.fc1(x)
-        x = F.relu(x)
+        x = F.relu(x, inplace=False)
         x = self.dropout2(x)
         x = self.fc2(x)
+        # print(x.shape)
         output = F.log_softmax(x, dim=1)
         return output
 
@@ -135,7 +143,7 @@ def run_parameter_server(rank, world_size):
     # in this case means that the parameter server will wait for all trainers
     # to complete, and then exit.
     print("PS master initializing RPC")
-    rpc.init_rpc(name="parameter_server", rank=rank, world_size=world_size)
+    rpc.init_rpc(name="parameter_server", rank=rank, world_size=world_size, backend=torch.distributed.rpc.BackendType.TENSORPIPE)
     print("RPC initialized! Running parameter server...")
     rpc.shutdown()
     print("RPC shutdown on parameter server.")
@@ -164,6 +172,13 @@ class TrainerNet(nn.Module):
             ParameterServer.forward, self.param_server_rref, x)
         return model_output
 
+from threading import Condition
+trainer_cv = Condition()
+def set_cv():
+    global trainer_cv
+    with trainer_cv:
+        trainer_cv.notify()
+
 
 def run_training_loop(rank, num_gpus, train_loader, test_loader):
     # Runs the typical neural network forward + backward + optimizer step, but
@@ -172,21 +187,38 @@ def run_training_loop(rank, num_gpus, train_loader, test_loader):
     # Build DistributedOptimizer.
     param_rrefs = net.get_global_param_rrefs()
     opt = DistributedOptimizer(optim.SGD, param_rrefs, lr=0.03)
-    for i, (data, target) in enumerate(train_loader):
-        with dist_autograd.context() as cid:
-            model_output = net(data)
-            target = target.to(model_output.device)
-            loss = F.nll_loss(model_output, target)
-            if i % 5 == 0:
-                print(f"Rank {rank} training batch {i} loss {loss.item()}")
-            dist_autograd.backward(cid, [loss])
-            # Ensure that dist autograd ran successfully and gradients were
-            # returned.
-            assert remote_method(
-                ParameterServer.get_dist_gradients,
-                net.param_server_rref,
-                cid) != {}
-            opt.step(cid)
+    for epoch in range(5):
+        for i, (data, target) in enumerate(train_loader):
+            with dist_autograd.context() as cid:
+                if rank == 1:
+                    with trainer_cv:
+                        trainer_cv.wait()
+                model_output = net(data)
+                device_id = model_output.device
+                target = target.to(device_id)
+                loss = F.nll_loss(model_output, target).clone()
+                if i % 5 == 0:
+                    print(f"Rank {rank} epoch {epoch} training batch {i} loss {loss.item()}")
+                dist_autograd.backward(cid, [loss])
+                # Ensure that dist autograd ran successfully and gradients were
+                # returned.
+                # assert remote_method(
+                #     ParameterServer.get_dist_gradients,
+                #     net.param_server_rref,
+                #     cid) != {}
+                opt.step(cid)
+            # after rank 2 is done with 1 iter, it notifies rank 1
+            if rank == 2:
+                rpc.rpc_sync("trainer_1", set_cv, args=())
+                # rank 0 waits for rank 1 to finish.
+                with trainer_cv:
+                    trainer_cv.wait()
+            # rank 1 has finished, let rank 2 stop waiting.
+            if rank == 1:
+                rpc.rpc_sync("trainer_2", set_cv, args=())
+        print(f"Epoch {epoch+1} completed!")
+        print("Getting accuracy....")
+        get_accuracy(test_loader, net)
 
     print("Training complete!")
     print("Getting accuracy....")
@@ -216,7 +248,7 @@ def run_worker(rank, world_size, num_gpus, train_loader, test_loader):
     rpc.init_rpc(
         name=f"trainer_{rank}",
         rank=rank,
-        world_size=world_size)
+        world_size=world_size, backend=torch.distributed.rpc.BackendType.TENSORPIPE)
 
     print(f"Worker {rank} done initializing RPC")
 
@@ -255,7 +287,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--master_port",
         type=str,
-        default="29500",
+        default="29504",
         help="""Port that master is listening on, will default to 29500 if not
         provided. Master must be able to accept network traffic on the host and port.""")
 
@@ -273,19 +305,19 @@ if __name__ == '__main__':
     else:
         # Get data to train on
         train_loader = torch.utils.data.DataLoader(
-            datasets.MNIST('../data', train=True, download=True,
+            datasets.MNIST('./', train=True, download=True,
                            transform=transforms.Compose([
                                transforms.ToTensor(),
                                transforms.Normalize((0.1307,), (0.3081,))
                            ])),
-            batch_size=32, shuffle=True)
+            batch_size=4, shuffle=True)
         test_loader = torch.utils.data.DataLoader(
-            datasets.MNIST('../data', train=False,
+            datasets.MNIST('./', train=False,
                            transform=transforms.Compose([
                                transforms.ToTensor(),
                                transforms.Normalize((0.1307,), (0.3081,))
                            ])),
-            batch_size=32, shuffle=True)
+            batch_size=4, shuffle=True)
         # start training worker on this node
         p = mp.Process(
             target=run_worker,
